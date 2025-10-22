@@ -61,7 +61,12 @@ class ParallelDataManagerConfig(VanillaDataManagerConfig):
     More details are described here: https://pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader"""
     cache_compressed_images: bool = False
     """If True, cache raw image files as byte strings to RAM."""
-
+    
+    # Added for LPIPS configuration
+    lpips_patch_size: int = 128
+    """Size of patches for LPIPS computation"""
+    use_lpips_patches: bool = False
+    """Whether to enable patch sampling for LPIPS"""
 
 class ParallelDataManager(DataManager, Generic[TDataset]):
     """Data manager implementation for parallel dataloading.
@@ -123,6 +128,60 @@ class ParallelDataManager(DataManager, Generic[TDataset]):
                         self.config.collate_fn = variable_res_collate
                         break
         super().__init__()
+
+        self.lpips_patch_size = config.lpips_patch_size
+        self.use_lpips_patches = config.use_lpips_patches
+
+    # Method same as VanillaDataManager
+    def sample_image_patch(
+        self,
+        image: torch.Tensor,
+        camera_idx: int,
+        patch_size: int
+    ) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        """Sample a random patch from an image.
+
+        Args:
+            image: Input image [H, W, 3]
+            camera_idx: Index of the camera
+            patch_size: Size of the square patch to extract
+
+        Returns:
+            Tuple of (patch [patch_size, patch_size, 3], (top, left) coordinates)
+        """
+        h, w = image.shape[:2]
+
+        # Handle images smaller than patch size
+        if h < patch_size or w < patch_size:
+            pad_h = max(0, patch_size - h)
+            pad_w = max(0, patch_size - w)
+
+            # Pad using reflection: [H, W, C] -> [C, H, W] for F.pad
+            image = image.permute(2, 0, 1)
+            image = F.pad(image, (0, pad_w, 0, pad_h), mode='reflect')
+            image = image.permute(1, 2, 0)  # Back to [H, W, C]
+            h, w = image.shape[:2]
+
+        # Sample random top-left corner
+        top = torch.randint(0, h - patch_size + 1, (1,)).item()
+        left = torch.randint(0, w - patch_size + 1, (1,)).item()
+
+        # Extract patch
+        patch = image[top:top+patch_size, left:left+patch_size, :]
+
+        return patch, (top, left)
+
+    # MODIFY the existing next_train method
+    def next_train(self, step: int) -> Tuple[RayBundle, Dict]:
+        """Returns the next batch of data from the train dataloader."""
+        # ... existing next_train code ...
+
+        # ADD THIS at the end before return:
+        if self.use_lpips_patches:
+            batch["full_image"] = image_batch["image"]
+            batch["camera_indices"] = image_batch["image_idx"]
+
+        return ray_bundle, batch
 
     @cached_property
     def dataset_type(self) -> Type[TDataset]:
