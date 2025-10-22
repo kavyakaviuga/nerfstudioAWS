@@ -40,6 +40,7 @@ from typing import (
 )
 
 import torch
+import torch.nn.functional as F
 import tyro
 from torch.nn import Parameter
 from torch.utils.data.distributed import DistributedSampler
@@ -312,6 +313,12 @@ class VanillaDataManagerConfig(DataManagerConfig):
     patch_size: int = 1
     """Size of patch to sample from. If > 1, patch-based sampling will be used."""
 
+    # LPIPS PATCH ALTERATIONS
+    lpips_patch_size: int = 128
+    """Size of patches for LPIPS computation"""
+    use_lpips_patches: bool = False  # Set to False by default
+    """Whether to enable patch sampling for LPIPS"""
+
     # tyro.conf.Suppress prevents us from creating CLI arguments for this field.
     camera_optimizer: tyro.conf.Suppress[Optional[CameraOptimizerConfig]] = field(default=None)
     """Deprecated, has been moved to the model config."""
@@ -396,7 +403,47 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
                         self.config.collate_fn = variable_res_collate
                         break
         super().__init__()
+        self.lpips_patch_size = config.lpips_patch_size
+        self.use_lpips_patches = config.use_lpips_patches
 
+    def sample_image_patch(
+        self,
+        image: torch.Tensor,
+        camera_idx: int,
+        patch_size: int
+    ) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        """Sample a random patch from an image.
+        
+        Args:
+            image: Input image [H, W, 3]
+            camera_idx: Index of the camera
+            patch_size: Size of the square patch to extract
+            
+        Returns:
+            Tuple of (patch [patch_size, patch_size, 3], (top, left) coordinates)
+        """
+        h, w = image.shape[:2]
+        
+        # Handle images smaller than patch size
+        if h < patch_size or w < patch_size:
+            pad_h = max(0, patch_size - h)
+            pad_w = max(0, patch_size - w)
+            
+            # Pad using reflection mode: [H, W, C] -> [C, H, W] for F.pad
+            image = image.permute(2, 0, 1)
+            image = F.pad(image, (0, pad_w, 0, pad_h), mode='reflect')
+            image = image.permute(1, 2, 0)  # Back to [H, W, C]
+            h, w = image.shape[:2]
+        
+        # Sample random top-left corner
+        top = torch.randint(0, h - patch_size + 1, (1,)).item()
+        left = torch.randint(0, w - patch_size + 1, (1,)).item()
+        
+        # Extract patch
+        patch = image[top:top+patch_size, left:left+patch_size, :]
+        
+        return patch, (top, left)
+    
     @cached_property
     def dataset_type(self) -> Type[TDataset]:
         """Returns the dataset type passed as the generic argument"""
@@ -512,6 +559,13 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
         batch = self.train_pixel_sampler.sample(image_batch)
         ray_indices = batch["indices"]
         ray_bundle = self.train_ray_generator(ray_indices)
+    
+        # Add full image to batch if LPIPS is enabled
+        if self.use_lpips_patches:
+            # Store full image and camera index for patch extraction in model in later steps
+            batch["full_image"] = image_batch["image"]  # [B, H, W, 3]
+            batch["camera_indices"] = image_batch["image_idx"]  # [B]
+    
         return ray_bundle, batch
 
     def next_eval(self, step: int) -> Tuple[RayBundle, Dict]:
