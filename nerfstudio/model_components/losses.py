@@ -584,3 +584,171 @@ def depth_ranking_loss(rendered_depth, gt_depth):
     out_diff = rendered_depth[::2, :] - rendered_depth[1::2, :] + m
     differing_signs = torch.sign(dpt_diff) != torch.sign(out_diff)
     return torch.nanmean((out_diff[differing_signs] * torch.sign(out_diff[differing_signs])))
+
+"""LPIPS Alteration"""
+
+import torch
+import torch.nn as nn
+import lpips
+from typing import Dict, Tuple, Optional
+
+
+class HybridRGBLPIPSLoss(nn.Module):
+    """Hybrid loss combining MSE and LPIPS for NeRF training.
+    
+    LPIPS requirements:
+    - Input format: NCHW (batch, channels, height, width)
+    - Data type: float32
+    - Value range: [-1, 1] (normalized from [0, 1])
+    
+    Args:
+        lpips_weight: Weight for LPIPS loss component
+        mse_weight: Weight for MSE loss component
+        lpips_every_n_steps: Compute LPIPS every N iterations
+        use_patches: Whether to use patch-based LPIPS
+        patch_size: Size of patches for LPIPS computation
+    """
+    
+    def __init__(
+        self,
+        lpips_weight: float = 0.1,
+        mse_weight: float = 1.0,
+        lpips_every_n_steps: int = 5,
+        use_patches: bool = True,
+        patch_size: int = 128,
+    ):
+        super().__init__()
+        self.lpips_weight = lpips_weight
+        self.mse_weight = mse_weight
+        self.lpips_every_n_steps = lpips_every_n_steps
+        self.use_patches = use_patches
+        self.patch_size = patch_size
+        self.step_counter = 0
+        
+        # Initialize LPIPS with AlexNet (lighter than VGG)
+        self.lpips_fn = lpips.LPIPS(net='alex', verbose=False)
+        
+        # Freeze LPIPS network to save memory
+        self.lpips_fn.eval()
+        for param in self.lpips_fn.parameters():
+            param.requires_grad = False
+    
+    def should_compute_lpips(self) -> bool:
+        """Check if LPIPS should be computed this iteration."""
+        return self.step_counter % self.lpips_every_n_steps == 0
+    
+    def compute_mse_loss(self, pred_rgb: torch.Tensor, target_rgb: torch.Tensor) -> torch.Tensor:
+        """Compute MSE loss on ray samples."""
+        return torch.nn.functional.mse_loss(pred_rgb, target_rgb)
+    
+    def prepare_image_for_lpips(self, image: torch.Tensor) -> torch.Tensor:
+        """Prepare image tensor for LPIPS input.
+        
+        Converts from NeRF format to LPIPS format:
+        - Input: [H, W, 3] in range [0, 1], any dtype
+        - Output: [1, 3, H, W] in range [-1, 1], float32
+        
+        Args:
+            image: Image tensor [H, W, 3] in range [0, 1]
+            
+        Returns:
+            Formatted image [1, 3, H, W] in range [-1, 1], dtype float32
+        """
+        # Ensure float32
+        if image.dtype != torch.float32:
+            image = image.float()
+        
+        # Clamp to [0, 1] range (safety check)
+        image = torch.clamp(image, 0.0, 1.0)
+        
+        # Convert from HWC to NCHW format
+        # [H, W, 3] -> [3, H, W] -> [1, 3, H, W]
+        image = image.permute(2, 0, 1).unsqueeze(0)
+        
+        # Normalize from [0, 1] to [-1, 1]
+        # LPIPS expects images in [-1, 1] range
+        image = image * 2.0 - 1.0
+        
+        # Final check: ensure contiguous memory layout
+        image = image.contiguous()
+        
+        return image
+    
+    def compute_lpips_loss(
+        self, 
+        pred_image: torch.Tensor, 
+        target_image: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute LPIPS loss on image patches.
+        
+        Args:
+            pred_image: Predicted image [H, W, 3] in range [0, 1]
+            target_image: Target image [H, W, 3] in range [0, 1]
+            
+        Returns:
+            LPIPS loss value (scalar)
+        """
+        # Validate input shapes
+        assert pred_image.shape == target_image.shape, \
+            f"Shape mismatch: pred {pred_image.shape} vs target {target_image.shape}"
+        assert pred_image.dim() == 3 and pred_image.shape[-1] == 3, \
+            f"Expected [H, W, 3] format, got {pred_image.shape}"
+        
+        # Convert to LPIPS format: NCHW, float32, [-1, 1]
+        pred_formatted = self.prepare_image_for_lpips(pred_image)
+        target_formatted = self.prepare_image_for_lpips(target_image)
+        
+        # Verify format requirements
+        assert pred_formatted.dim() == 4, "Should be NCHW format"
+        assert pred_formatted.shape[1] == 3, "Should have 3 channels"
+        assert pred_formatted.dtype == torch.float32, "Should be float32"
+        assert pred_formatted.min() >= -1.0 and pred_formatted.max() <= 1.0, \
+            f"Values should be in [-1, 1], got [{pred_formatted.min()}, {pred_formatted.max()}]"
+        
+        # Compute LPIPS without gradients to save memory
+        with torch.no_grad():
+            # LPIPS returns a tensor of shape [1, 1, 1, 1] or [1]
+            lpips_val = self.lpips_fn(pred_formatted, target_formatted)
+        
+        # Return scalar value
+        return lpips_val.squeeze()
+    
+    def forward(
+        self,
+        pred_rgb: torch.Tensor,
+        target_rgb: torch.Tensor,
+        pred_image: Optional[torch.Tensor] = None,
+        target_image: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute hybrid loss.
+        
+        Args:
+            pred_rgb: Predicted RGB values from rays [N, 3] in range [0, 1]
+            target_rgb: Target RGB values from rays [N, 3] in range [0, 1]
+            pred_image: Full rendered image [H, W, 3] in range [0, 1] (optional, for LPIPS)
+            target_image: Full target image [H, W, 3] in range [0, 1] (optional, for LPIPS)
+            
+        Returns:
+            Total loss and dict of individual loss components
+        """
+        # Always compute MSE loss
+        mse_loss = self.compute_mse_loss(pred_rgb, target_rgb)
+        total_loss = self.mse_weight * mse_loss
+        
+        loss_dict = {
+            "rgb_loss": mse_loss,
+        }
+        
+        # Compute LPIPS periodically if images are provided
+        if (self.should_compute_lpips() and 
+            pred_image is not None and 
+            target_image is not None):
+            
+            lpips_loss = self.compute_lpips_loss(pred_image, target_image)
+            total_loss = total_loss + self.lpips_weight * lpips_loss
+            loss_dict["lpips_loss"] = lpips_loss
+        
+        self.step_counter += 1
+        
+        return total_loss, loss_dict
+
