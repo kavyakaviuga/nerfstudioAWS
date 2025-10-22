@@ -19,7 +19,7 @@ NeRF implementation that combines many recent advancements.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Tuple, Type
+from typing import Dict, List, Literal, Optional, Tuple, Type
 
 import numpy as np
 import torch
@@ -34,6 +34,7 @@ from nerfstudio.fields.density_fields import HashMLPDensityField
 from nerfstudio.fields.nerfacto_field import NerfactoField
 from nerfstudio.model_components.losses import (
     MSELoss,
+    HybridRGBLPIPSLoss,
     distortion_loss,
     interlevel_loss,
     orientation_loss,
@@ -130,6 +131,16 @@ class NerfactoModelConfig(ModelConfig):
     """Average initial density output from MLP. """
     camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="SO3xR3"))
     """Config of the camera optimizer to use"""
+
+    # Added for LPIPS configuration
+    use_lpips: bool = False
+    """Whether to use LPIPS loss during training"""
+    lpips_weight: float = 0.1
+    """Weight for LPIPS loss component"""
+    lpips_every_n_steps: int = 5
+    """Compute LPIPS every N training iterations"""
+    lpips_patch_size: int = 128
+    """Size of patches for LPIPS computation"""
 
 
 class NerfactoModel(Model):
@@ -251,6 +262,110 @@ class NerfactoModel(Model):
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
         self.step = 0
+        
+        # Added LPIPS initialization when flagged
+        if self.config.use_lpips:
+            self.lpips_loss_fn = HybridRGBLPIPSLoss(
+                lpips_weight=self.config.lpips_weight,
+                mse_weight=1.0,
+                lpips_every_n_steps=self.config.lpips_every_n_steps,
+                use_patches=True,
+                patch_size=self.config.lpips_patch_size,
+            )
+
+    # 3.3.3: Add method to render image patches
+    def render_image_patch(
+        self,
+        camera_idx: int,
+        patch_coords: Tuple[int, int],
+        patch_size: int,
+    ) -> torch.Tensor:
+        """Render a specific patch region from the NeRF model.
+        
+        Only generates and renders rays for the patch region,
+        avoiding memory overhead of rendering full images.
+        
+        Args:
+            camera_idx: Index of camera to use
+            patch_coords: (top, left) position of patch
+            patch_size: Size of square patch
+            
+        Returns:
+            Rendered patch [patch_size, patch_size, 3], float32, range [0, 1]
+        """
+        top, left = patch_coords
+        
+        # Get the camera
+        camera = self.train_dataset.cameras[camera_idx].to(self.device)
+        
+        # Get image dimensions
+        height = int(camera.height.item())
+        width = int(camera.width.item())
+        
+        # Clamp patch to image bounds
+        top = max(0, min(top, height - patch_size))
+        left = max(0, min(left, width - patch_size))
+        
+        # Generate pixel coordinates for patch
+        coords = self._get_patch_coords(top, left, patch_size, height, width)
+        
+        # Generate rays for these coordinates
+        ray_bundle = camera.generate_rays(
+            camera_indices=0,
+            coords=coords,
+        )
+        
+        # Render in chunks to manage memory
+        chunk_size = 4096
+        rgb_outputs = []
+        
+        num_rays = ray_bundle.origins.shape[0]
+        for i in range(0, num_rays, chunk_size):
+            end_idx = min(i + chunk_size, num_rays)
+            
+            # Create ray bundle for this chunk
+            chunk_bundle = RayBundle(
+                origins=ray_bundle.origins[i:end_idx],
+                directions=ray_bundle.directions[i:end_idx],
+                pixel_area=ray_bundle.pixel_area[i:end_idx] if ray_bundle.pixel_area is not None else None,
+                camera_indices=ray_bundle.camera_indices[i:end_idx] if ray_bundle.camera_indices is not None else None,
+                nears=ray_bundle.nears[i:end_idx] if ray_bundle.nears is not None else None,
+                fars=ray_bundle.fars[i:end_idx] if ray_bundle.fars is not None else None,
+                metadata=ray_bundle.metadata,
+            )
+            
+            # Render this chunk
+            with torch.no_grad():  # No gradients needed for LPIPS input
+                outputs = self.get_outputs(chunk_bundle)
+                rgb_outputs.append(outputs["rgb"])
+                accumulation_outputs.append(outputs["accumulation"])
+    
+        # Concatenate and reshape to patch
+        rgb_flat = torch.cat(rgb_outputs, dim=0)
+        accumulation_flat = torch.cat(accumulation_outputs, dim=0)
+    
+        rendered_rgb = rgb_flat.view(patch_size, patch_size, 3)
+        rendered_accumulation = accumulation_flat.view(patch_size, patch_size, 1)
+    
+        # Apply background blending (same as training)
+        # Create a dummy gt_image (will be ignored in blending)
+        dummy_gt = torch.zeros_like(rendered_rgb)
+    
+        # Use the same blending function
+        rendered_rgb_blended, _ = self.renderer_rgb.blend_background_for_loss_computation(
+            pred_image=rendered_rgb.view(-1, 3),
+            pred_accumulation=rendered_accumulation.view(-1, 1),
+            gt_image=dummy_gt.view(-1, 3),
+        )
+    
+        # Reshape back to patch
+        rendered_patch = rendered_rgb_blended.view(patch_size, patch_size, 3)
+    
+        # Ensure float32 and clamp to [0, 1]
+        rendered_patch = rendered_patch.float()
+        rendered_patch = torch.clamp(rendered_patch, 0.0, 1.0)
+    
+        return rendered_patch
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
@@ -368,8 +483,66 @@ class NerfactoModel(Model):
             pred_accumulation=outputs["accumulation"],
             gt_image=image,
         )
+        
+        # Ensure float32 and [0, 1] range for LPIPS compatibility
+        gt_rgb = gt_rgb.float()
+        pred_rgb = pred_rgb.float()
+        gt_rgb = torch.clamp(gt_rgb, 0.0, 1.0)
+        pred_rgb = torch.clamp(pred_rgb, 0.0, 1.0)
+        
+        # Compute RGB loss (with optional LPIPS)
+        if not self.config.use_lpips:
+            # Standard RGB loss only
+            loss_dict["rgb_loss"] = self.rgb_loss(gt_rgb, pred_rgb)
+        else:
+            # Check if LPIPS should be computed this iteration
+            should_compute_lpips = self.lpips_loss_fn.should_compute_lpips()
+        
+            # LPIPS requires full image in batch
+            if should_compute_lpips and "full_image" in batch and "camera_indices" in batch:
+                # Get full target image
+                full_target_image = batch["full_image"][0].to(self.device).float()
+                full_target_image = torch.clamp(full_target_image, 0.0, 1.0)
+            
+                camera_idx = batch["camera_indices"][0].item()
+            
+                # Sample a random patch from target image
+                target_patch, patch_coords = self.datamanager.sample_image_patch(
+                    full_target_image,
+                    camera_idx,
+                    self.config.lpips_patch_size
+                )
+            
+                # Render the same patch region from NeRF
+                # Disable autocast to ensure float32 throughout
+                with torch.cuda.amp.autocast(enabled=False):
+                    rendered_patch = self.render_image_patch(
+                        camera_idx=camera_idx,
+                        patch_coords=patch_coords,
+                        patch_size=self.config.lpips_patch_size,
+                    )
+            
+                # Apply background blending to rendered patch if needed
+                # (You may need to render accumulation for the patch too)
+                # For now, assuming rendered_patch is already properly blended
+            
+                # Compute hybrid loss (MSE on rays + LPIPS on patches)
+                total_loss, component_losses = self.lpips_loss_fn(
+                    pred_rgb=pred_rgb,
+                    target_rgb=gt_rgb,
+                    pred_image=rendered_patch,
+                    target_image=target_patch
+                )
+            
+                # Add component losses to dict
+                loss_dict["rgb_loss"] = component_losses["rgb_loss"]
+                if "lpips_loss" in component_losses:
+                    loss_dict["lpips_loss"] = component_losses["lpips_loss"]
+            else:
+                # No LPIPS this iteration, just standard RGB loss
+                loss_dict["rgb_loss"] = self.rgb_loss(gt_rgb, pred_rgb)
+   
 
-        loss_dict["rgb_loss"] = self.rgb_loss(gt_rgb, pred_rgb)
         if self.training:
             loss_dict["interlevel_loss"] = self.config.interlevel_loss_mult * interlevel_loss(
                 outputs["weights_list"], outputs["ray_samples_list"]
